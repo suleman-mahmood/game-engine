@@ -84,6 +84,7 @@ impl Instance {
         let result = pos_matrix * rot_matrix;
         InstanceRaw {
             model: result.into(),
+            normal: cgmath::Matrix3::from(self.rotation).into(),
         }
     }
 }
@@ -92,9 +93,10 @@ impl Instance {
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct InstanceRaw {
     model: [[f32; 4]; 4],
+    normal: [[f32; 3]; 3],
 }
 
-impl InstanceRaw {
+impl model::Vertex for InstanceRaw {
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         use std::mem;
 
@@ -122,6 +124,21 @@ impl InstanceRaw {
                     shader_location: 8,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
+                    shader_location: 9,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 19]>() as wgpu::BufferAddress,
+                    shader_location: 10,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 22]>() as wgpu::BufferAddress,
+                    shader_location: 11,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
             ],
         }
     }
@@ -130,17 +147,20 @@ impl InstanceRaw {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
+    view_position: [f32; 4],
     view_proj: [[f32; 4]; 4],
 }
 
 impl CameraUniform {
     fn new() -> Self {
         Self {
+            view_position: [0.0; 4],
             view_proj: cgmath::Matrix4::identity().into(),
         }
     }
 
     fn update_view_proj(&mut self, camera: &camera::Camera) {
+        self.view_position = camera.eye.to_homogeneous().into();
         self.view_proj = camera.build_view_projection_matrix().into();
     }
 }
@@ -271,7 +291,7 @@ impl State {
                 label: Some("Camera Bind Group Layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
