@@ -5,11 +5,17 @@ mod texture;
 
 use cgmath::SquareMatrix;
 use cgmath::prelude::*;
+use std::time::Duration;
+use std::time::Instant;
 use std::{
     io::{self, Write},
     sync::Arc,
 };
 use wgpu::util::DeviceExt;
+use winit::event::DeviceEvent;
+use winit::event::ElementState;
+use winit::event::Event;
+use winit::event::MouseButton;
 
 use wgpu::{
     Backends, CommandEncoderDescriptor, Device, DeviceDescriptor, Features, Limits, LoadOp,
@@ -18,9 +24,8 @@ use wgpu::{
     TextureViewDescriptor, Trace,
 };
 use winit::{
-    application::ApplicationHandler,
     event::{KeyEvent, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
@@ -57,10 +62,58 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     env_logger::init();
 
-    let event_loop = EventLoop::with_user_event().build()?;
-    let mut app = App::new();
+    let event_loop = EventLoop::new()?;
 
-    event_loop.run_app(&mut app)?;
+    let window_attributes = Window::default_attributes();
+    let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
+    let mut state = pollster::block_on(State::new(window)).unwrap();
+
+    let mut last_render_time = Instant::now();
+
+    event_loop.run(move |event, control_flow| match event {
+        Event::DeviceEvent {
+            event: DeviceEvent::MouseMotion { delta },
+            ..
+        } => {
+            if state.mouse_pressed {
+                state.camera_controller.handle_mouse(delta.0, delta.1)
+            }
+        }
+        Event::WindowEvent {
+            ref event,
+            window_id,
+        } if window_id == state.window.id() && !state.input(event) => match event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        ..
+                    },
+                ..
+            } => control_flow.exit(),
+            WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                let dt = now - last_render_time;
+                last_render_time = now;
+                state.update(dt);
+                match state.render() {
+                    Ok(_) => {}
+                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        let size = state.window.inner_size();
+                        state.resize(size.width, size.height);
+                    }
+                    Err(e) => {
+                        log::error!("Unable to render: {}", e)
+                    }
+                };
+            }
+            _ => {}
+        },
+        _ => {}
+    })?;
 
     Ok(())
 }
@@ -159,9 +212,9 @@ impl CameraUniform {
         }
     }
 
-    fn update_view_proj(&mut self, camera: &camera::Camera) {
-        self.view_position = camera.eye.to_homogeneous().into();
-        self.view_proj = camera.build_view_projection_matrix().into();
+    fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
+        self.view_position = camera.position.to_homogeneous().into();
+        self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into();
     }
 }
 
@@ -189,10 +242,12 @@ struct State {
     depth_texture: texture::Texture,
 
     camera: camera::Camera,
+    projection: camera::Projection,
+    camera_controller: camera::CameraController,
+
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    camera_controller: camera::CameraController,
 
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
@@ -200,6 +255,8 @@ struct State {
     light_uniform: LightUniform,
     light_buffer: wgpu::Buffer,
     light_bind_group: wgpu::BindGroup,
+
+    mouse_pressed: bool,
 }
 
 impl State {
@@ -283,18 +340,13 @@ impl State {
                 ],
             });
 
-        let camera = camera::Camera {
-            eye: (0.0, 1.0, 2.0).into(),
-            target: (0.0, 0.0, 0.0).into(),
-            up: cgmath::Vector3::unit_y(),
-            aspect: config.width as f32 / config.height as f32,
-            fovy: 45.0,
-            znear: 0.1,
-            zfar: 100.0,
-        };
+        let camera = camera::Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
+        let projection =
+            camera::Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
+        let camera_controller = camera::CameraController::new(4.0, 0.4);
 
         let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera);
+        camera_uniform.update_view_proj(&camera, &projection);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -417,8 +469,6 @@ impl State {
                 .await
                 .unwrap();
 
-        let camera_controller = camera::CameraController::new(0.2);
-
         const SPACE_BETWEEN: f32 = 3.0;
         let instances = (0..NUM_INSTANCES_PER_ROW)
             .flat_map(|z| {
@@ -467,10 +517,12 @@ impl State {
             depth_texture,
 
             camera,
+            projection,
+            camera_controller,
+
             camera_uniform,
             camera_buffer,
             camera_bind_group,
-            camera_controller,
 
             instances,
             instance_buffer,
@@ -478,6 +530,8 @@ impl State {
             light_uniform,
             light_buffer,
             light_bind_group,
+
+            mouse_pressed: false,
         })
     }
 
@@ -486,6 +540,7 @@ impl State {
             return;
         }
 
+        self.projection.resize(width, height);
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
@@ -567,20 +622,38 @@ impl State {
         Ok(())
     }
 
-    fn handle_key(&self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
-        match (code, is_pressed) {
-            (KeyCode::Escape, true) => event_loop.exit(),
-            _ => {}
+    fn input(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state,
+                        ..
+                    },
+                ..
+            } => self.camera_controller.process_keyboard(*key, *state),
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.camera_controller.handle_mouse_scroll(delta);
+                true
+            }
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state,
+                ..
+            } => {
+                self.mouse_pressed = *state == ElementState::Pressed;
+                true
+            }
+            _ => false,
         }
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        self.camera_controller.process_events(event)
-    }
+    fn update(&mut self, dt: Duration) {
+        self.camera_controller.update_camera(&mut self.camera, dt);
+        self.camera_uniform
+            .update_view_proj(&self.camera, &self.projection);
 
-    fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
-        self.camera_uniform.update_view_proj(&self.camera);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -589,77 +662,16 @@ impl State {
 
         // Update light
         let old_position: cgmath::Vector3<_> = self.light_uniform.position.into();
-        self.light_uniform.position =
-            (cgmath::Quaternion::from_axis_angle((0.0, 1.0, 0.0).into(), cgmath::Deg(1.0))
-                * old_position)
-                .into();
+        self.light_uniform.position = (cgmath::Quaternion::from_axis_angle(
+            (0.0, 1.0, 0.0).into(),
+            cgmath::Deg(60.0 * dt.as_secs_f32()),
+        ) * old_position)
+            .into();
         self.queue.write_buffer(
             &self.light_buffer,
             0,
             bytemuck::cast_slice(&[self.light_uniform]),
         );
-    }
-}
-
-struct App {
-    state: Option<State>,
-}
-
-impl App {
-    pub fn new() -> Self {
-        Self { state: None }
-    }
-}
-
-impl ApplicationHandler<State> for App {
-    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let window_attributes = Window::default_attributes();
-
-        let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-
-        self.state = Some(pollster::block_on(State::new(window)).unwrap())
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
-        event: winit::event::WindowEvent,
-    ) {
-        let state = match &mut self.state {
-            Some(canvas) => canvas,
-            None => return,
-        };
-
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
-            WindowEvent::RedrawRequested => {
-                state.update();
-                match state.render() {
-                    Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        let size = state.window.inner_size();
-                        state.resize(size.width, size.height);
-                    }
-                    Err(e) => {
-                        log::error!("Unable to render: {}", e)
-                    }
-                };
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
-                        state: key_state,
-                        ..
-                    },
-                ..
-            } => state.handle_key(event_loop, code, key_state.is_pressed()),
-            _ => {}
-        }
-
-        state.input(&event);
     }
 }
 
