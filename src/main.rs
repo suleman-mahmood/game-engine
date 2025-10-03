@@ -1,4 +1,5 @@
 mod camera;
+mod hdr;
 mod model;
 mod resources;
 mod texture;
@@ -304,6 +305,8 @@ struct State {
     light_bind_group: wgpu::BindGroup,
 
     mouse_pressed: bool,
+
+    hdr: hdr::HdrPipeline,
 }
 
 impl State {
@@ -344,7 +347,7 @@ impl State {
             height: size.height,
             present_mode: surface_capabilities.present_modes[0],
             alpha_mode: surface_capabilities.alpha_modes[0],
-            view_formats: vec![],
+            view_formats: vec![surface_format.add_srgb_suffix()],
             desired_maximum_frame_latency: 2,
         };
 
@@ -473,6 +476,8 @@ impl State {
                 push_constant_ranges: &[],
             });
 
+        let hdr = hdr::HdrPipeline::new(&device, &config);
+
         let render_pipeline = {
             let shader = wgpu::ShaderModuleDescriptor {
                 label: Some("Normal Shader"),
@@ -483,9 +488,10 @@ impl State {
                 "Normal Render Pipeline",
                 &device,
                 &render_pipeline_layout,
-                config.format,
+                hdr.format(),
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc(), InstanceRaw::desc()],
+                wgpu::PrimitiveTopology::TriangleList,
                 shader,
             )
         };
@@ -504,9 +510,10 @@ impl State {
                 "Light Render Pipeline",
                 &device,
                 &layout,
-                config.format,
+                hdr.format(),
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc()],
+                wgpu::PrimitiveTopology::TriangleList,
                 shader,
             )
         };
@@ -579,6 +586,8 @@ impl State {
             light_bind_group,
 
             mouse_pressed: false,
+
+            hdr,
         })
     }
 
@@ -588,6 +597,8 @@ impl State {
         }
 
         self.projection.resize(width, height);
+        self.hdr.resize(&self.device, width, height);
+
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
@@ -620,7 +631,7 @@ impl State {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Some Render Pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
+                    view: self.hdr.view(),
                     resolve_target: None,
                     depth_slice: None,
                     ops: Operations {
@@ -662,6 +673,8 @@ impl State {
                 &self.light_bind_group,
             );
         }
+
+        self.hdr.process(&mut encoder, &view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -729,6 +742,7 @@ fn create_render_pipeline(
     color_format: wgpu::TextureFormat,
     depth_format: Option<wgpu::TextureFormat>,
     vertex_layouts: &[wgpu::VertexBufferLayout],
+    topology: wgpu::PrimitiveTopology,
     shader: wgpu::ShaderModuleDescriptor,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(shader);
@@ -753,7 +767,7 @@ fn create_render_pipeline(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            topology,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: Some(wgpu::Face::Back),
