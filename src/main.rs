@@ -12,9 +12,9 @@ use std::{
     sync::Arc,
 };
 use wgpu::util::DeviceExt;
+use winit::application::ApplicationHandler;
 use winit::event::DeviceEvent;
 use winit::event::ElementState;
-use winit::event::Event;
 use winit::event::MouseButton;
 
 use wgpu::{
@@ -55,34 +55,63 @@ fn _game_loop() {
     }
 }
 
-fn main() {
-    run().unwrap();
-}
-
-fn run() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let window_attributes = Window::default_attributes();
-    let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-    let mut state = pollster::block_on(State::new(window)).unwrap();
+    let mut app = App::new();
+    event_loop.run_app(&mut app)?;
 
-    let mut last_render_time = Instant::now();
+    Ok(())
+}
 
-    event_loop.run(move |event, control_flow| match event {
-        Event::DeviceEvent {
-            event: DeviceEvent::MouseMotion { delta },
-            ..
-        } => {
-            if state.mouse_pressed {
-                state.camera_controller.handle_mouse(delta.0, delta.1)
-            }
+struct App {
+    window: Option<Arc<Window>>,
+    state: Option<State>,
+    last_render_time: Instant,
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self {
+            window: None,
+            state: None,
+            last_render_time: Instant::now(),
         }
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == state.window.id() && !state.input(event) => match event {
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let window_attr = Window::default_attributes();
+        let window = event_loop.create_window(window_attr).unwrap();
+        let window = Arc::new(window);
+
+        self.window = Some(window.clone());
+        self.state = Some(pollster::block_on(State::new(window)).unwrap());
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if self.state.is_none() || self.window.is_none() {
+            return;
+        }
+        if self.window.as_mut().unwrap().id() != window_id {
+            return;
+        }
+
+        let state = self.state.as_mut().unwrap();
+        if state.input(&event) {
+            return;
+        }
+
+        match event {
             WindowEvent::CloseRequested
             | WindowEvent::KeyboardInput {
                 event:
@@ -92,12 +121,12 @@ fn run() -> anyhow::Result<()> {
                         ..
                     },
                 ..
-            } => control_flow.exit(),
+            } => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = now - last_render_time;
-                last_render_time = now;
+                let dt = now - self.last_render_time;
+                self.last_render_time = now;
                 state.update(dt);
                 match state.render() {
                     Ok(_) => {}
@@ -111,11 +140,29 @@ fn run() -> anyhow::Result<()> {
                 };
             }
             _ => {}
-        },
-        _ => {}
-    })?;
+        }
+    }
 
-    Ok(())
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if self.state.is_none() {
+            return;
+        }
+        let state = self.state.as_mut().unwrap();
+
+        match event {
+            DeviceEvent::MouseMotion { delta } => {
+                if state.mouse_pressed {
+                    state.camera_controller.handle_mouse(delta.0, delta.1)
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
